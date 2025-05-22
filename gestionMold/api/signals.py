@@ -8,97 +8,136 @@ from channels.layers import get_channel_layer
 from django.db.models.signals import post_save, pre_save
 from django.dispatch import receiver
 from django.utils import timezone
-from django.core.exceptions import ValidationError
 
 from .models import (
-    Produit, Order, LoyaltyProgram, ProductReview,
-    Payment, Delivery
+    Product, Order, LoyaltyProgram, ProductReview,
+    Payment, Delivery, CustomUser, RefundRequest,
+    ExchangeRequest, StockMovement, StockAlert, CustomUser, ClientProfile
 )
-from .utils import send_alert
+from .utils import send_alert, send_sms
 
 logger = logging.getLogger(__name__)
 
 
-# ─── 1) Alerte de stock faible ─────────────────────────────────────────────────
-@receiver(post_save, sender=Produit)
+# 1) Alerte de stock faible
+@receiver(post_save, sender=Product)
 def notify_low_stock(sender, instance, **kwargs):
-    """
-    Quand un produit est sauvegardé et que son stock < 5,
-    envoie un message sur le canal 'stock_alerts'.
-    """
-    if instance.quantite_en_stock < 5:
+    CRITICAL_THRESHOLD = 5
+    if instance.quantity_in_stock is not None and instance.quantity_in_stock < CRITICAL_THRESHOLD:
         channel_layer = get_channel_layer()
         async_to_sync(channel_layer.group_send)(
             'stock_alerts',
             {
                 'type': 'stock_alert',
                 'data': {
-                    'produit': instance.nom,
-                    'stock': instance.quantite_en_stock
+                    'product': instance.name,
+                    'stock': instance.quantity_in_stock,
+                    'timestamp': timezone.now().isoformat()
                 }
             }
         )
 
-
-# ─── 2) Création de la livraison à la création de commande ────────────────────────
+# 2) Création automatique de la livraison
 @receiver(post_save, sender=Order)
 def create_delivery_for_new_order(sender, instance, created, **kwargs):
-    """
-    À la création d'une commande, crée automatiquement
-    l’enregistrement Delivery associé, si pas déjà présent.
-    """
-    if created and not hasattr(instance, 'delivery'):
+    if created and not Delivery.objects.filter(order=instance).exists():
         Delivery.objects.create(order=instance)
 
-
-# ─── 3) Attribution de points fidélité à la livraison ─────────────────────────────
+# 3) Attribution de points fidélité à la livraison
 @receiver(post_save, sender=Order)
 def award_loyalty_points_on_delivery(sender, instance, **kwargs):
-    """
-    Dès qu’une commande passe en status DELIVERED,
-    on ajoute les points au programme fidélité du client.
-    """
-    if instance.status == 'DELIVERED':
+    if instance.order_status == Order.DELIVERED:
         loyalty, _ = LoyaltyProgram.objects.get_or_create(client=instance.client)
-        # évite d’ajouter deux fois pour la même commande
         if not any(txn.get('order') == instance.id for txn in loyalty.transactions):
             points = loyalty.add_points(instance)
-            logger.debug(f"Ajout de {points} points fidélité pour la commande #{instance.id}")
+            logger.debug(f"Ajout de {points} pts fidélité pour commande #{instance.id}")
 
-
-# ─── 4) Notification sur nouvel avis produit ─────────────────────────────────────
+# 4) Notification sur nouvel avis produit + SMS admin
 @receiver(post_save, sender=ProductReview)
 def notify_on_product_review(sender, instance, created, **kwargs):
-    """
-    Lorsqu’un client crée un avis, envoie une alerte
-    au propriétaire du produit.
-    """
     if created:
-        try:
-            product_owner = instance.product.user
-            send_alert(
-                recipient=product_owner,
-                message=f"Nouvel avis sur {instance.product.name} : {instance.rating}/5"
-            )
-        except Exception as e:
-            logger.error(f"Échec notification avis produit: {e}")
+        admins = CustomUser.objects.filter(is_staff=True, is_active=True)
+        message = f"Nouvel avis sur « {instance.product.name} » : {instance.rating}/5"
+        send_alert(recipient=admins, message=message)
+        for admin in admins:
+            if hasattr(admin, 'phone_number') and admin.phone_number:
+                try:
+                    send_sms(admin.phone_number, message)
+                except Exception as e:
+                    logger.warning(f"Erreur SMS admin {admin.id}: {e}")
 
-
-# ─── 5) Mise à jour du paiement et du statut de commande ─────────────────────────
+# 5) Mise à jour du statut de commande sur paiement
 @receiver(post_save, sender=Payment)
-def update_order_payment(sender, instance, **kwargs):
-    """
-    Quand un paiement devient COMPLETED, on met à jour
-    le montant payé et le statut de la commande.
-    """
-    if instance.status == 'COMPLETED':
-        order = instance.order
-        # somme déjà payée
-        paid_so_far = sum(p.amount for p in order.payments.filter(status='COMPLETED'))
-        order.paid_amount = paid_so_far
-        order.save()
-        order.update_payment_status()
+def update_order_on_payment(sender, instance, **kwargs):
+    if instance.payment_status == Payment.PAID:
+        try:
+            instance.order.update_status_if_paid()
+        except Exception as e:
+            logger.error(f"Erreur update_status_if_paid pour commande #{instance.order.id}: {e}")
 
+# 6) Alerte et relance sur Demande de remboursement + SMS admin
+@receiver(post_save, sender=RefundRequest)
+def notify_on_refund_request(sender, instance, created, **kwargs):
+    if created:
+        admins = CustomUser.objects.filter(is_staff=True, is_active=True)
+        message = f"Nouvelle demande de remboursement pour commande #{instance.order.id}"
+        send_alert(recipient=admins, message=message)
+        for admin in admins:
+            if hasattr(admin, 'phone_number') and admin.phone_number:
+                try:
+                    send_sms(admin.phone_number, message)
+                except Exception as e:
+                    logger.warning(f"Erreur SMS admin {admin.id}: {e}")
 
-# ─── 6) Gestion des erreurs centrales (exemple) ────────────────────────────────────
-# (si vous utilisez CustomExceptionMiddleware, laissez-le gérer les exceptions)
+# 7) Création d'un échange de produit + SMS client
+@receiver(post_save, sender=ExchangeRequest)
+def notify_on_exchange_request(sender, instance, created, **kwargs):
+    if created:
+        client_user = instance.return_request.order_line.order.client.user
+        message = f"Votre demande d'échange pour commande #{instance.return_request.order_line.order.id} est enregistrée"
+        send_alert(recipient=client_user, message=message)
+        if hasattr(client_user, 'phone_number') and client_user.phone_number:
+            try:
+                send_sms(client_user.phone_number, message)
+            except Exception as e:
+                logger.warning(f"Erreur SMS client {client_user.id}: {e}")
+
+# 8) Vérification & notification sur mouvement de stock
+@receiver(post_save, sender=StockMovement)
+def check_stock_alerts(sender, instance, **kwargs):
+    for alert in StockAlert.objects.filter(product=instance.product, is_active=True):
+        alert.check_stock()
+
+# 9) Gestion des signaux côté Delivery (WebSocket + SMS client)
+@receiver(post_save, sender=Delivery)
+def notify_delivery_status_change(sender, instance, **kwargs):
+    channel_layer = get_channel_layer()
+    async_to_sync(channel_layer.group_send)(
+        f"user_{instance.order.client.user.id}_deliveries",
+        {
+            'type': 'delivery_update',
+            'data': {
+                'order_id': instance.order.id,
+                'status': instance.delivery_status,
+                'updated_at': timezone.now().isoformat()
+            }
+        }
+    )
+    client_user = instance.order.client.user
+    message = f"Votre livraison pour la commande #{instance.order.id} est maintenant : {instance.delivery_status}"
+    if hasattr(client_user, 'phone_number') and client_user.phone_number:
+        try:
+            send_sms(client_user.phone_number, message)
+        except Exception as e:
+            logger.warning(f"Erreur SMS client {client_user.id}: {e}")
+
+# 10) Création de profil client avec SMS de bienvenue
+@receiver(post_save, sender=CustomUser)
+def create_client_profile(sender, instance, created, **kwargs):
+    if created and instance.is_client:
+        ClientProfile.objects.get_or_create(user=instance)
+        if hasattr(instance, 'phone_number') and instance.phone_number:
+            try:
+                send_sms(instance.phone_number, "Bienvenue sur la plateforme !")
+            except Exception as e:
+                logger.warning(f"Erreur SMS bienvenue {instance.id}: {e}")

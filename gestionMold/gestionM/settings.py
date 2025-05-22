@@ -12,6 +12,8 @@ SALES_MODEL_PATH = BASE_DIR / 'ai_models' / 'sales_model.pkl'
 SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'replace-me-with-secure-key')
 DEBUG = True
 ALLOWED_HOSTS = os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+CORS_ALLOW_ALL_ORIGINS = True
+
 
 # === Applications ===
 INSTALLED_APPS = [
@@ -22,12 +24,16 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles', 
     'django_extensions',
+    'drf_spectacular',
+    'drf_spectacular_sidecar',
 
     'corsheaders',
     'rest_framework',
     'rest_framework_simplejwt',
+    'rest_framework_simplejwt.token_blacklist',
     'djoser',
     'channels',
+    'django_filters',
 
     'api.apps.ApiConfig',
     'ai.apps.AiConfig',
@@ -126,6 +132,9 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': int(os.getenv('PAGE_SIZE', 20)),
+    'EXCEPTION_HANDLER': 'rest_framework.views.exception_handler',
+    'DEFAULT_FILTER_BACKENDS': ['django_filters.rest_framework.DjangoFilterBackend'],
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
 }
 
 # === Simple JWT ===
@@ -194,3 +203,21 @@ if not DEBUG:
     X_FRAME_OPTIONS = 'DENY'
     CSRF_COOKIE_SECURE = True
     SESSION_COOKIE_SECURE = True
+
+TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
+TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
+TWILIO_FROM_NUMBER = os.getenv('TWILIO_FROM_NUMBER')
+
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'API Mon Projet',
+    'DESCRIPTION': 'Documentation de l\'API pour le backend Django',
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    'SWAGGER_UI_DIST': 'SIDECAR',
+    'REDOC_DIST': 'SIDECAR',
+      'ENUM_NAME_OVERRIDES': {
+        'status': 'RefundStatusEnum',
+        'status_1': 'OrderStatusEnum',
+    },
+}
+
